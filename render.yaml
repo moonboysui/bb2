@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: moonbags-buybot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    repo: https://github.com/moonboysui/moonbags-buybot.git # Update with your repo
+    branch: main
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: BLOCKEDEN_WSS
+        sync: false
+      - key: BLOCKEDEN_RPC
+        sync: false
+      - key: SUIVISION_API_KEY
+        sync: false
+      - key: PORT
+        value: 8080
+    autoDeploy: true
