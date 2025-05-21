@@ -6,7 +6,8 @@ from decimal import Decimal
 from typing import Dict, Optional, List, Union
 import aiohttp
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, ChatTypeFilter
+from aiogram.filters import Command
+from aiogram.enums import ChatType  # This is the correct import
 from aiogram.types import (
     InlineKeyboardMarkup, 
     InlineKeyboardButton, 
