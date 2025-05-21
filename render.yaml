@@ -8,7 +8,7 @@ services:
     branch: main
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11
+        value: 3.9.18  # Updated to a more stable version
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: DATABASE_URL
@@ -21,4 +21,6 @@ services:
         sync: false
       - key: PORT
         value: 8080
+      - key: TRENDING_CHANNEL
+        value: "@moonbagstrending"
     autoDeploy: true
