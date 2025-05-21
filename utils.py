@@ -1,77 +1,184 @@
 import re
-from aiogram import types
-from sqlalchemy.ext.asyncio import AsyncSession
-from database import GroupConfig
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Optional, Dict, Any, Union
+import aiohttp
+from urllib.parse import urlparse
 
-def short_addr(addr: str) -> str:
-    if not addr or len(addr) < 10:
-        return addr
-    return f"{addr[:6]}...{addr[-4:]}"
+class Utils:
+    @staticmethod
+    def format_amount(amount: Union[Decimal, float, str], decimals: int = 2) -> str:
+        """Format numerical amounts with proper separators and decimals"""
+        try:
+            if isinstance(amount, str):
+                amount = Decimal(amount)
+            
+            if amount >= 1_000_000:
+                return f"${amount / 1_000_000:,.2f}M"
+            elif amount >= 1_000:
+                return f"${amount / 1_000:,.2f}K"
+            else:
+                return f"${amount:,.{decimals}f}"
+        except:
+            return "$0.00"
 
-def format_number(n, decimals=2):
-    if n is None:
-        return "N/A"
-    if n >= 1_000_000:
-        return f"{n/1_000_000:.{decimals}f}M"
-    if n >= 1_000:
-        return f"{n/1_000:.{decimals}f}K"
-    return f"{n:.{decimals}f}"
+    @staticmethod
+    def format_large_number(number: Union[Decimal, int, float]) -> str:
+        """Format large numbers with K, M, B suffixes"""
+        try:
+            number = float(number)
+            if number >= 1_000_000_000:
+                return f"{number / 1_000_000_000:.1f}B"
+            elif number >= 1_000_000:
+                return f"{number / 1_000_000:.1f}M"
+            elif number >= 1_000:
+                return f"{number / 1_000:.1f}K"
+            else:
+                return f"{number:.1f}"
+        except:
+            return "0"
 
-def is_admin(member: types.ChatMember) -> bool:
-    return getattr(member, 'is_chat_admin', False) or getattr(member, 'status', '') in ('administrator', 'creator')
+    @staticmethod
+    def format_price_change(change: Decimal) -> str:
+        """Format price change with color emoji"""
+        try:
+            if change > 0:
+                return f"🟢 +{change:.2f}%"
+            elif change < 0:
+                return f"🔴 {change:.2f}%"
+            else:
+                return "⚪ 0.00%"
+        except:
+            return "⚪ 0.00%"
 
-def valid_url(url: str) -> bool:
-    return re.match(r'https?://', url or '')
+    @staticmethod
+    def shorten_address(address: str, chars: int = 4) -> str:
+        """Shorten blockchain address"""
+        if not address:
+            return ""
+        return f"{address[:chars]}...{address[-chars:]}"
 
-def buy_emoji_line(emoji: str, usd: float, step: float) -> str:
-    if not emoji or not step or step <= 0:
-        return ""
-    count = int(usd // step)
-    return emoji * min(count, 50)  # prevent emoji spam, max 50
+    @staticmethod
+    def validate_url(url: str) -> bool:
+        """Validate URL format"""
+        try:
+            result = urlparse(url)
+            return all([result.scheme, result.netloc])
+        except:
+            return False
 
-def get_swap_link(token_address: str) -> str:
-    # Generic swap link, can be customized
-    return f"https://dexscreener.com/sui/{token_address}"
+    @staticmethod
+    def is_valid_emoji(text: str) -> bool:
+        """Check if string is a valid emoji"""
+        if not text:
+            return False
+        return len(text.encode('utf-16-le')) >= 4 and len(text) <= 2
 
-async def get_group_config(session: AsyncSession, group_id: str) -> GroupConfig:
-    return await session.get(GroupConfig, group_id)
+    @staticmethod
+    def parse_amount(amount_str: str) -> Optional[Decimal]:
+        """Parse amount string to Decimal"""
+        try:
+            # Remove currency symbols and whitespace
+            cleaned = re.sub(r'[^\d.]', '', amount_str)
+            return Decimal(cleaned)
+        except:
+            return None
 
-def format_alert(data: dict, config: GroupConfig, trending_channel=''):
-    # Compose alert message with all required formatting, links, and rich info
-    # See your spec for required fields
-    token = config.token_symbol
-    emoji = config.emoji or ""
-    buy_line = buy_emoji_line(emoji, data['usd_amount'], config.buy_step)
-    token_telegram = config.telegram or "#"
-    alert = (
-        f"<b><a href='{token_telegram}'>{token} Buy!</a></b>\n"
-        f"{buy_line}\n"
-        f"⬅️ Size ${format_number(data['usd_amount'])} | {format_number(data['sui_amount'])} SUI\n"
-        f"➡️ Got {format_number(data['token_amount'])} {token}\n\n"
-        f"👤 Buyer <a href='{data['buyer_link']}'>{short_addr(data['buyer'])}</a> | "
-        f"<a href='{data['txn_link']}'>Txn</a>\n"
-        f"🔼 MCap ${format_number(data['market_cap'])}\n"
-        f"📊 TVL/Liq ${format_number(data['tvl'])}\n"
-        f"📊 Price ${format_number(data['price'], 5)}\n"
-        f"💧 SUI Price: ${format_number(data['sui_price'], 2)}\n\n"
-        f"<a href='{config.website}'>Website</a> | "
-        f"<a href='{config.telegram}'>Telegram</a> | "
-        f"<a href='{config.x}'>X</a>\n\n"
-        f"Chart ({config.chart_url}) | Vol. Bot (https://t.me/suivolumebot) | "
-        f"Sui Trending ({trending_channel or 'https://t.me/moonbagstrending'})\n"
-        f"———\n"
-        f"Ad: Place your advertisement here (https://t.me/BullsharkTrendingBot?start=adBuyRequest)"
-    )
-    return alert
+    @staticmethod
+    def utc_now() -> datetime:
+        """Get current UTC datetime"""
+        return datetime.now(timezone.utc)
 
-def format_leaderboard(entries: list):
-    header = "<b>Top 10 Trending Tokens (30m Vol)</b>\n\n"
-    lines = []
-    for i, entry in enumerate(entries, 1):
-        lines.append(
-            f"{i}. <a href='{entry['telegram']}'>{entry['symbol']}</a> | "
-            f"MCap: ${format_number(entry['mcap'])} | "
-            f"30m Vol: ${format_number(entry['volume'])} | "
-            f"{entry['change']}%"
-        )
-    return header + "\n".join(lines)
+    @staticmethod
+    def format_duration(hours: int) -> str:
+        """Format duration in hours to human readable string"""
+        if hours >= 168:  # 1 week
+            weeks = hours // 168
+            return f"{weeks}w"
+        elif hours >= 24:
+            days = hours // 24
+            return f"{days}d"
+        else:
+            return f"{hours}h"
+
+    @staticmethod
+    def format_timeago(dt: datetime) -> str:
+        """Format datetime to time ago string"""
+        now = Utils.utc_now()
+        diff = now - dt
+        
+        seconds = diff.total_seconds()
+        if seconds < 60:
+            return "just now"
+        elif seconds < 3600:
+            minutes = int(seconds / 60)
+            return f"{minutes}m ago"
+        elif seconds < 86400:
+            hours = int(seconds / 3600)
+            return f"{hours}h ago"
+        elif seconds < 604800:
+            days = int(seconds / 86400)
+            return f"{days}d ago"
+        else:
+            return dt.strftime("%Y-%m-%d")
+
+    @staticmethod
+    async def get_sui_price() -> Decimal:
+        """Get current SUI price from CoinGecko"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://api.coingecko.com/api/v3/simple/price",
+                    params={
+                        "ids": "sui",
+                        "vs_currencies": "usd"
+                    }
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return Decimal(str(data["sui"]["usd"]))
+        except:
+            pass
+        return Decimal("0")
+
+    @staticmethod
+    def calculate_boost_multiplier(paid_amount: Decimal) -> Decimal:
+        """Calculate boost multiplier based on paid amount"""
+        # Base multiplier is 1.5x
+        base_multiplier = Decimal("1.5")
+        
+        # Additional multiplier based on payment amount
+        if paid_amount >= 180:  # 1 week
+            return base_multiplier * Decimal("2.5")
+        elif paid_amount >= 110:  # 72 hours
+            return base_multiplier * Decimal("2.0")
+        elif paid_amount >= 80:  # 48 hours
+            return base_multiplier * Decimal("1.8")
+        elif paid_amount >= 45:  # 24 hours
+            return base_multiplier * Decimal("1.5")
+        elif paid_amount >= 27:  # 12 hours
+            return base_multiplier * Decimal("1.3")
+        elif paid_amount >= 20:  # 8 hours
+            return base_multiplier * Decimal("1.2")
+        else:  # 4 hours
+            return base_multiplier
+
+    @staticmethod
+    def generate_buy_link(token_address: str) -> str:
+        """Generate buy link for token"""
+        return f"https://app.cetus.zone/swap?from=sui&to={token_address}"
+
+    @staticmethod
+    def generate_chart_link(token_address: str) -> str:
+        """Generate chart link for token"""
+        return f"https://dexscreener.com/sui/{token_address}"
+
+    @staticmethod
+    def safe_division(numerator: Decimal, denominator: Decimal) -> Decimal:
+        """Safely divide two decimals"""
+        try:
+            if denominator == 0:
+                return Decimal("0")
+            return numerator / denominator
+        except:
+            return Decimal("0")
