@@ -1,428 +1,542 @@
-import asyncio
 import os
+import asyncio
 import logging
-import datetime
-
+from datetime import datetime, timedelta
+from decimal import Decimal
+from typing import Dict, Optional, List, Union
+import aiohttp
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, CommandStart
-from aiogram.types import FSInputFile
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.utils.markdown import hbold
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
-
-from database import async_session, init_db, GroupConfig, Boost, TokenLeaderboard, BuyEvent
-from utils import (
-    is_admin, format_alert, format_leaderboard, get_swap_link,
-    buy_emoji_line, short_addr
+from aiogram.filters import Command, ChatTypeFilter
+from aiogram.types import (
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton, 
+    CallbackQuery,
+    Message,
+    ChatMemberUpdated,
+    Chat
 )
-import sui_api
-
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramAPIError
+from sqlalchemy.ext.asyncio import AsyncSession
 from dotenv import load_dotenv
+from database import (
+    init_db, 
+    get_session, 
+    Token, 
+    Group, 
+    Boost, 
+    GroupConfig,
+    TokenStats
+)
+from sui_api import SuiAPI, TokenData, BuyData
+from config import Config, ConfigState
+import json
+import re
+from decimal import ROUND_DOWN
+import traceback
+from web3.main import Web3
 
+# Load environment variables
 load_dotenv()
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Constants
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-BOOST_WALLET_ADDRESS = os.environ.get("BOOST_WALLET_ADDRESS")
 TRENDING_CHANNEL = os.environ.get("TRENDING_CHANNEL", "@moonbagstrending")
+BOOST_WALLET = "0x7338ef163ee710923803cb0dd60b5b02cddc5fbafef417342e1bbf1fba20e702"
+MIN_TRENDING_BUY = 200  # Minimum buy amount in USD for trending channel
+PORT = int(os.environ.get("PORT", 8080))
+DEFAULT_BUY_STEP = 5
+DEFAULT_MIN_BUY = 1
+MAX_EMOJIS = 50
 
-logging.basicConfig(level=logging.INFO)
+# Initialize bot and dispatcher
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
-dp = Dispatcher(storage=MemoryStorage())
+dp = Dispatcher()
 
-# --- CONFIGURATION FSM ---
+# State storage
+config_sessions: Dict[int, Config] = {}
+boost_sessions: Dict[int, dict] = {}
+active_groups: Dict[int, GroupConfig] = {}
+token_cache: Dict[str, TokenData] = {}
+pending_boosts: Dict[str, dict] = {}
 
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
+# Boost pricing and durations
+BOOST_OPTIONS = {
+    "4h": {"duration": 4, "price": 15, "display": "4 Hours - 15 SUI"},
+    "8h": {"duration": 8, "price": 20, "display": "8 Hours - 20 SUI"},
+    "12h": {"duration": 12, "price": 27, "display": "12 Hours - 27 SUI"},
+    "24h": {"duration": 24, "price": 45, "display": "24 Hours - 45 SUI"},
+    "48h": {"duration": 48, "price": 80, "display": "48 Hours - 80 SUI"},
+    "72h": {"duration": 72, "price": 110, "display": "72 Hours - 110 SUI"},
+    "1w": {"duration": 168, "price": 180, "display": "1 Week - 180 SUI"}
+}
 
-class ConfigStates(StatesGroup):
-    waiting_token_address = State()
-    waiting_token_name = State()
-    waiting_token_symbol = State()
-    waiting_emoji = State()
-    waiting_buy_step = State()
-    waiting_min_buy = State()
-    waiting_website = State()
-    waiting_telegram = State()
-    waiting_x = State()
-    waiting_chart_url = State()
-    waiting_media = State()
-    confirm = State()
+class BuyBotException(Exception):
+    """Custom exception for bot-specific errors"""
+    pass
 
-# --- GROUP CONFIG COMMAND ---
-
-@dp.message(CommandStart())
-async def start_handler(message: types.Message, state: FSMContext):
-    if message.chat.type in ("group", "supergroup"):
-        # Only admins can configure
-        user = await bot.get_chat_member(message.chat.id, message.from_user.id)
-        if not is_admin(user):
-            await message.reply("Only group admins can configure the buybot.")
-            return
-        await message.reply("Please continue setup in private chat. "
-                            "Message me here: https://t.me/{}".format(bot.me.username))
-        return
-    await message.answer("Welcome to the Sui Buybot!\nType /config to start setup for your group.")
-
-@dp.message(Command("config"))
-async def config_start(message: types.Message, state: FSMContext):
-    await message.answer("Let's start configuration. Please enter the token contract address you want to track:")
-    await state.set_state(ConfigStates.waiting_token_address)
-
-@dp.message(ConfigStates.waiting_token_address)
-async def config_token_address(message: types.Message, state: FSMContext):
-    await state.update_data(token_address=message.text.strip())
-    await message.answer("Token name (e.g., Mooncoin):")
-    await state.set_state(ConfigStates.waiting_token_name)
-
-@dp.message(ConfigStates.waiting_token_name)
-async def config_token_name(message: types.Message, state: FSMContext):
-    await state.update_data(token_name=message.text.strip())
-    await message.answer("Token symbol (e.g., MOON):")
-    await state.set_state(ConfigStates.waiting_token_symbol)
-
-@dp.message(ConfigStates.waiting_token_symbol)
-async def config_token_symbol(message: types.Message, state: FSMContext):
-    await state.update_data(token_symbol=message.text.strip())
-    await message.answer("Emoji for buys (e.g., 🌕):")
-    await state.set_state(ConfigStates.waiting_emoji)
-
-@dp.message(ConfigStates.waiting_emoji)
-async def config_token_emoji(message: types.Message, state: FSMContext):
-    await state.update_data(emoji=message.text.strip())
-    await message.answer("Buy step (how many $ per emoji, e.g., 1 means 1 emoji per $1, 5 means 1 emoji per $5):")
-    await state.set_state(ConfigStates.waiting_buy_step)
-
-@dp.message(ConfigStates.waiting_buy_step)
-async def config_buy_step(message: types.Message, state: FSMContext):
+async def validate_token_address(address: str) -> bool:
+    """Validate Sui token address format and existence"""
+    if not re.match(r'^0x[a-fA-F0-9]{64}$', address):
+        return False
     try:
-        buy_step = float(message.text.strip())
-        await state.update_data(buy_step=buy_step)
-    except Exception:
-        await message.answer("Please enter a valid number (e.g., 1 or 5)")
-        return
-    await message.answer("Minimum buy in USD to alert (e.g., 10):")
-    await state.set_state(ConfigStates.waiting_min_buy)
-
-@dp.message(ConfigStates.waiting_min_buy)
-async def config_min_buy(message: types.Message, state: FSMContext):
-    try:
-        min_buy = float(message.text.strip())
-        await state.update_data(min_buy=min_buy)
-    except Exception:
-        await message.answer("Please enter a valid number (e.g., 10)")
-        return
-    await message.answer("Website link (or skip):")
-    await state.set_state(ConfigStates.waiting_website)
-
-@dp.message(ConfigStates.waiting_website)
-async def config_website(message: types.Message, state: FSMContext):
-    await state.update_data(website=message.text.strip())
-    await message.answer("Telegram link (or skip):")
-    await state.set_state(ConfigStates.waiting_telegram)
-
-@dp.message(ConfigStates.waiting_telegram)
-async def config_telegram(message: types.Message, state: FSMContext):
-    await state.update_data(telegram=message.text.strip())
-    await message.answer("X (Twitter) link (or skip):")
-    await state.set_state(ConfigStates.waiting_x)
-
-@dp.message(ConfigStates.waiting_x)
-async def config_x(message: types.Message, state: FSMContext):
-    await state.update_data(x=message.text.strip())
-    await message.answer("Chart link (or skip):")
-    await state.set_state(ConfigStates.waiting_chart_url)
-
-@dp.message(ConfigStates.waiting_chart_url)
-async def config_chart_url(message: types.Message, state: FSMContext):
-    await state.update_data(chart_url=message.text.strip())
-    await message.answer("You can now upload a token logo/image, or type 'skip':")
-    await state.set_state(ConfigStates.waiting_media)
-
-@dp.message(ConfigStates.waiting_media)
-async def config_media(message: types.Message, state: FSMContext):
-    media_id = None
-    if message.content_type in ("photo",):
-        media_id = message.photo[-1].file_id
-    elif message.text and message.text.strip().lower() == "skip":
-        pass
-    else:
-        await message.answer("Please send a photo or type 'skip'.")
-        return
-    await state.update_data(custom_media_id=media_id)
-    data = await state.get_data()
-    summary = (f"Config summary:\n"
-               f"Token address: {data['token_address']}\n"
-               f"Name: {data['token_name']}\n"
-               f"Symbol: {data['token_symbol']}\n"
-               f"Emoji: {data['emoji']}\n"
-               f"Buy step: {data['buy_step']}\n"
-               f"Min buy: {data['min_buy']}\n"
-               f"Website: {data['website']}\n"
-               f"Telegram: {data['telegram']}\n"
-               f"X: {data['x']}\n"
-               f"Chart: {data['chart_url']}\n"
-               f"Media: {'Provided' if media_id else 'Not provided'}\n"
-               "Type 'confirm' to save, or 'cancel' to abort.")
-    await message.answer(summary)
-    await state.set_state(ConfigStates.confirm)
-
-@dp.message(ConfigStates.confirm)
-async def config_confirm(message: types.Message, state: FSMContext):
-    if message.text.strip().lower() == "confirm":
-        user_id = message.from_user.id
-        async with async_session() as session:
-            data = await state.get_data()
-            # For this example, group_id is set to user's private chat ID; in practice, you'd map this to their group.
-            group_id = str(user_id)
-            # Save config
-            config = await session.get(GroupConfig, group_id)
-            if not config:
-                config = GroupConfig(
-                    group_id=group_id,
-                    token_address=data['token_address'],
-                    token_name=data['token_name'],
-                    token_symbol=data['token_symbol'],
-                    emoji=data['emoji'],
-                    buy_step=data['buy_step'],
-                    min_buy=data['min_buy'],
-                    website=data['website'],
-                    telegram=data['telegram'],
-                    x=data['x'],
-                    chart_url=data['chart_url'],
-                    custom_media_id=data['custom_media_id'],
-                )
-                session.add(config)
-            else:
-                for k, v in data.items():
-                    setattr(config, k, v)
-            await session.commit()
-        await message.answer("Configuration saved! Buys will now be tracked for your group.")
-        await state.clear()
-    else:
-        await message.answer("Cancelled.")
-        await state.clear()
-
-# --- BUY EVENT HANDLER ---
-
-async def handle_buy_event(buy_event):
-    # For each group config, check if buy_event.token matches and send alerts
-    async with async_session() as session:
-        q = await session.execute(select(GroupConfig))
-        configs = q.scalars()
-        for config in configs:
-            if buy_event["token"] == config.token_address:
-                # Only send if meets min_buy threshold, unless boosted
-                boosted = await is_boosted(session, config.token_address)
-                if buy_event["usd_amount"] >= config.min_buy or boosted:
-                    await send_buy_alert(buy_event, config, boosted)
-                    # Record event for leaderboard
-                    await save_buy_event(session, buy_event, config.group_id)
-                    await update_leaderboard(session, buy_event, config)
-
-async def is_boosted(session: AsyncSession, token_address: str) -> bool:
-    now = datetime.datetime.utcnow()
-    q = await session.execute(
-        select(Boost).where(
-            Boost.token_address == token_address,
-            Boost.is_active == True,
-            Boost.start_time <= now,
-            Boost.end_time >= now
-        )
-    )
-    return q.scalar_one_or_none() is not None
-
-async def send_buy_alert(buy_event, config, boosted):
-    # Compose alert message
-    media = config.custom_media_id
-    msg = format_alert(buy_event, config, trending_channel=TRENDING_CHANNEL)
-    # Inline button: buy link
-    buy_btn = types.InlineKeyboardButton(text="Buy", url=get_swap_link(config.token_address))
-    kb = types.InlineKeyboardMarkup(inline_keyboard=[[buy_btn]])
-    # Send to group (simulate group_id as user_id for now; in prod, store real group chat IDs)
-    try:
-        if media:
-            await bot.send_photo(chat_id=config.group_id, photo=media, caption=msg, reply_markup=kb)
-        else:
-            await bot.send_message(chat_id=config.group_id, text=msg, reply_markup=kb)
+        return await SuiAPI.token_exists(address)
     except Exception as e:
-        logging.error(f"Error sending alert to group {config.group_id}: {e}")
-    # If boosted or over $200, send in trending channel
-    if boosted or buy_event["usd_amount"] >= 200:
-        try:
-            if media:
-                await bot.send_photo(chat_id=TRENDING_CHANNEL, photo=media, caption=msg, reply_markup=kb)
-            else:
-                await bot.send_message(chat_id=TRENDING_CHANNEL, text=msg, reply_markup=kb)
-        except Exception as e:
-            logging.error(f"Error sending alert to trending channel: {e}")
+        logger.error(f"Error validating token address: {e}")
+        return False
 
-async def save_buy_event(session: AsyncSession, buy_event, group_id):
-    event = BuyEvent(
-        token_address=buy_event["token"],
-        group_id=group_id,
-        buyer=buy_event["buyer"],
-        amount_usd=buy_event["usd_amount"],
-        amount_sui=buy_event["sui_amount"],
-        amount_token=buy_event["token_amount"],
-        tx_hash=buy_event["tx_hash"],
-    )
-    session.add(event)
-    await session.commit()
-
-async def update_leaderboard(session: AsyncSession, buy_event, config):
-    # Update or insert leaderboard entry
-    q = await session.execute(
-        select(TokenLeaderboard).where(TokenLeaderboard.token_address == config.token_address)
-    )
-    entry = q.scalar_one_or_none()
-    now = datetime.datetime.utcnow()
-    if not entry:
-        entry = TokenLeaderboard(
-            token_address=config.token_address,
-            token_symbol=config.token_symbol,
-            group_id=config.group_id,
-            volume_30m=buy_event["usd_amount"],
-            market_cap=buy_event["market_cap"],
-            price=buy_event["price"],
-            percent_change_30m=0,
-            last_updated=now,
-            boost_points=0,
-            telegram=config.telegram,
-            chart_url=config.chart_url,
+def create_config_keyboard(current_config: Optional[Config] = None) -> InlineKeyboardMarkup:
+    """Create configuration keyboard with current status"""
+    builder = InlineKeyboardBuilder()
+    
+    buttons = [
+        ("🎯 Token Address", "config_token", "✓" if current_config and current_config.token_address else "❌"),
+        ("🌟 Buy Emojis", "config_emoji", "✓" if current_config and current_config.emoji else "❌"),
+        ("💰 Min Buy ($)", "config_min_buy", "✓" if current_config and current_config.min_buy else "❌"),
+        ("📊 Buy Step ($)", "config_buy_step", "✓" if current_config and current_config.buy_step else "❌"),
+        ("💬 Telegram", "config_telegram", "✓" if current_config and current_config.telegram_link else "❌"),
+        ("🌐 Website", "config_website", "✓" if current_config and current_config.website_link else "❌"),
+        ("🐦 Twitter", "config_twitter", "✓" if current_config and current_config.twitter_link else "❌"),
+        ("🖼 Custom Media", "config_media", "✓" if current_config and current_config.custom_media else "❌")
+    ]
+    
+    for text, callback_data, status in buttons:
+        builder.button(
+            text=f"{text} {status}",
+            callback_data=callback_data
         )
-        session.add(entry)
-    else:
-        # Add to volume, update price/mcap
-        entry.volume_30m += buy_event["usd_amount"]
-        entry.market_cap = buy_event["market_cap"]
-        entry.price = buy_event["price"]
-        entry.last_updated = now
-    await session.commit()
+    
+    builder.button(text="✅ Save Configuration", callback_data="config_save")
+    builder.button(text="❌ Cancel", callback_data="config_cancel")
+    
+    builder.adjust(2, 2, 2, 2, 2)
+    return builder.as_markup()
 
-# --- LEADERBOARD PERIODIC TASK ---
+def create_boost_keyboard() -> InlineKeyboardMarkup:
+    """Create boost options keyboard"""
+    builder = InlineKeyboardBuilder()
+    
+    for key, data in BOOST_OPTIONS.items():
+        builder.button(
+            text=data["display"],
+            callback_data=f"boost_{key}"
+        )
+    
+    builder.button(text="❌ Cancel Boost", callback_data="boost_cancel")
+    builder.adjust(1)
+    return builder.as_markup()
 
-async def leaderboard_task():
-    while True:
-        await asyncio.sleep(60 * 30)
-        async with async_session() as session:
-            # Fetch top 10 by volume_30m + boost_points
-            q = await session.execute(
-                select(TokenLeaderboard).order_by(
-                    (TokenLeaderboard.volume_30m + TokenLeaderboard.boost_points).desc()
-                ).limit(10)
+async def format_buy_alert(
+    buy_data: BuyData,
+    token_config: GroupConfig,
+    is_trending: bool = False
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Format buy alert message with custom emojis and data"""
+    try:
+        # Calculate emoji count based on buy_step
+        emoji_count = min(
+            int(Decimal(buy_data.amount_usd) / Decimal(token_config.buy_step)),
+            MAX_EMOJIS
+        )
+        emojis = (token_config.emoji + " ") * emoji_count if emoji_count > 0 else ""
+        
+        # Format wallet address
+        wallet = f"{buy_data.buyer_address[:4]}...{buy_data.buyer_address[-4:]}"
+        
+        # Build message
+        message_parts = [
+            f"<b>{token_config.symbol} Buy!</b>\n",
+            f"\n{emojis}\n" if emojis else "\n",
+            f"⬅️ Size ${buy_data.amount_usd:,.2f} | {buy_data.amount_sui:.2f} SUI",
+            f"➡️ Got {buy_data.token_amount:,.2f} {token_config.symbol}\n",
+            f"👤 <a href='{buy_data.buyer_url}'>{wallet}</a> | <a href='{buy_data.tx_url}'>Txn</a>",
+            f"🔼 MCap ${buy_data.mcap:,.2f}",
+            f"📊 TVL/Liq ${buy_data.liquidity:,.2f}",
+            f"📊 Price ${buy_data.price:.8f}",
+            f"💧 SUI Price: ${buy_data.sui_price:.2f}\n"
+        ]
+
+        # Add configured links
+        links = []
+        if token_config.website_link:
+            links.append(f"<a href='{token_config.website_link}'>Website</a>")
+        if token_config.telegram_link:
+            links.append(f"<a href='{token_config.telegram_link}'>Telegram</a>")
+        if token_config.twitter_link:
+            links.append(f"<a href='{token_config.twitter_link}'>X</a>")
+        
+        if links:
+            message_parts.append(" | ".join(links) + "\n")
+        
+        # Add standard footer
+        message_parts.extend([
+            f"\n<a href='{buy_data.chart_url}'>Chart</a> | ",
+            f"<a href='https://t.me/suivolumebot'>Vol. Bot</a> | ",
+            f"<a href='https://t.me/SuiTrendingBullShark'>Sui Trending</a>\n",
+            "———\n",
+            "<a href='https://t.me/BullsharkTrendingBot?start=adBuyRequest'>",
+            "Ad: Place your advertisement here</a>"
+        ])
+        
+        message = "\n".join(message_parts)
+        
+        # Create buy button
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="🛍 Buy Now",
+                url=buy_data.buy_url
             )
-            entries = q.scalars().all()
-            leaderboard = [
-                {
-                    "symbol": e.token_symbol,
-                    "telegram": e.telegram,
-                    "mcap": e.market_cap,
-                    "volume": e.volume_30m,
-                    "change": f"{e.percent_change_30m:+.2f}"
-                }
-                for e in entries
-            ]
-            msg = format_leaderboard(leaderboard)
-            try:
-                await bot.send_message(chat_id=TRENDING_CHANNEL, text=msg)
-            except Exception as e:
-                logging.error(f"Error sending leaderboard: {e}")
-
-# --- BOOST HANDLER ---
-
-class BoostStates(StatesGroup):
-    waiting_token_address = State()
-    waiting_duration = State()
-    waiting_deposit = State()
-    confirm_boost = State()
-
-BOOST_OPTIONS = [
-    ("4 hours", 15, 4),
-    ("8 hours", 20, 8),
-    ("12 hours", 27, 12),
-    ("24 hours", 45, 24),
-    ("48 hours", 80, 48),
-    ("72 hours", 110, 72),
-    ("1 Week", 180, 168),
-]
+        ]])
+        
+        return message, keyboard
+        
+    except Exception as e:
+        logger.error(f"Error formatting buy alert: {e}")
+        raise BuyBotException("Failed to format buy alert")
+       
+# Command Handlers
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    """Handle /start command"""
+    user_id = message.from_user.id
+    
+    if message.chat.type == "private":
+        if "config_" in message.text:
+            # Configuration flow from group
+            group_id = int(message.text.split("_")[1])
+            config = Config(group_id=group_id)
+            config_sessions[user_id] = config
+            
+            await message.answer(
+                "Welcome to Moon BuyBot configuration! 🌙\n\n"
+                "Please configure the following settings for your group:",
+                reply_markup=create_config_keyboard()
+            )
+        else:
+            await message.answer(
+                "🌙 Welcome to Moon BuyBot!\n\n"
+                "Add me to your group and make me admin to start tracking token buys.\n"
+                "Use /config in your group to set up tracking.\n"
+                "Use /boost to boost your token in @moonbagstrending!"
+            )
+    else:
+        # Check if user is admin
+        member = await bot.get_chat_member(message.chat.id, message.from_user.id)
+        if member.status in ["creator", "administrator"]:
+            await message.answer(
+                "Let's configure the buy bot for your group! Click below to start:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="🔧 Configure Bot",
+                        url=f"https://t.me/{(await bot.me()).username}?start=config_{message.chat.id}"
+                    )
+                ]])
+            )
+        else:
+            await message.answer("⚠️ Only group administrators can configure the bot.")
 
 @dp.message(Command("boost"))
-async def boost_start(message: types.Message, state: FSMContext):
-    await message.answer("Enter the token contract address you want to boost:")
-    await state.set_state(BoostStates.waiting_token_address)
-
-@dp.message(BoostStates.waiting_token_address)
-async def boost_token_addr(message: types.Message, state: FSMContext):
-    await state.update_data(token_address=message.text.strip())
-    opts = "\n".join([f"{i+1}. {x[0]} - {x[1]} SUI" for i, x in enumerate(BOOST_OPTIONS)])
-    await message.answer(f"Select boost duration:\n{opts}\n\nReply with the number (e.g., 1 for 4 hours):")
-    await state.set_state(BoostStates.waiting_duration)
-
-@dp.message(BoostStates.waiting_duration)
-async def boost_duration(message: types.Message, state: FSMContext):
-    try:
-        idx = int(message.text.strip()) - 1
-        option = BOOST_OPTIONS[idx]
-        await state.update_data(duration=option[2], price=option[1])
-    except Exception:
-        await message.answer("Please reply with a valid number (1-7).")
+async def cmd_boost(message: types.Message):
+    """Handle /boost command"""
+    if message.chat.type != "private":
+        await message.answer(
+            "Please use this command in private chat:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="🚀 Boost Token",
+                    url=f"https://t.me/{(await bot.me()).username}?start=boost"
+                )
+            ]])
+        )
         return
-    await message.answer(f"Send {option[1]} SUI to {BOOST_WALLET_ADDRESS}.\n"
-                         f"Reply with your transaction hash after payment:")
-    await state.set_state(BoostStates.waiting_deposit)
+    
+    boost_sessions[message.from_user.id] = {
+        "step": "token",
+        "timestamp": datetime.utcnow()
+    }
+    
+    await message.answer(
+        "🚀 Token Boost Configuration\n\n"
+        "Please enter the contract address of the token you want to boost:\n"
+        "Example: 0x7b888393d6a552819bb0a7f878183abaf04550bfb9546b20ea586d338210826f"
+    )
 
-@dp.message(BoostStates.waiting_deposit)
-async def boost_deposit(message: types.Message, state: FSMContext):
-    tx_hash = message.text.strip()
-    data = await state.get_data()
-    # TODO: Verify transaction on-chain (out of scope for this example)
-    await state.update_data(tx_hash=tx_hash)
-    await message.answer("Verifying payment...")
-    # Simulate verification success
-    await asyncio.sleep(2)
-    # Activate boost
-    now = datetime.datetime.utcnow()
-    end_time = now + datetime.timedelta(hours=data["duration"])
-    async with async_session() as session:
-        # Only one boost per token at a time
-        await session.execute(
-            update(Boost)
-            .where(Boost.token_address == data["token_address"], Boost.is_active == True)
-            .values(is_active=False)
-        )
-        boost = Boost(
-            token_address=data["token_address"],
-            start_time=now,
-            end_time=end_time,
-            paid_amount=data["price"],
-            owner=message.from_user.id,
-            group_id=str(message.from_user.id),
-            is_active=True,
-        )
-        session.add(boost)
-        await session.commit()
-    await message.answer("Boost activated!")
-    # Alert trending channel
+@dp.callback_query(F.data.startswith("boost_"))
+async def handle_boost_callback(callback: CallbackQuery):
+    """Handle boost duration selection"""
+    user_id = callback.from_user.id
+    
+    if user_id not in boost_sessions:
+        await callback.answer("Please start the boost process again with /boost")
+        return
+    
+    if callback.data == "boost_cancel":
+        del boost_sessions[user_id]
+        await callback.message.edit_text("Boost configuration cancelled.")
+        return
+    
+    duration_key = callback.data.split("_")[1]
+    boost_data = BOOST_OPTIONS[duration_key]
+    session = boost_sessions[user_id]
+    
+    session.update({
+        "duration": boost_data["duration"],
+        "price": boost_data["price"],
+        "step": "payment"
+    })
+    
+    payment_instructions = (
+        f"🚀 Boost Payment\n\n"
+        f"Token: {session['token']}\n"
+        f"Duration: {boost_data['display']}\n\n"
+        f"Please send exactly {boost_data['price']} SUI to:\n"
+        f"<code>{BOOST_WALLET}</code>\n\n"
+        f"Your token will be boosted for {boost_data['duration']} hours after payment confirmation.\n"
+        f"Payment window: 30 minutes"
+    )
+    
+    await callback.message.edit_text(
+        payment_instructions,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Cancel Payment", callback_data="boost_cancel")
+        ]])
+    )
+    
+    # Start payment monitoring
+    asyncio.create_task(monitor_boost_payment(user_id, session))
+
+async def monitor_boost_payment(user_id: int, session: dict):
+    """Monitor for boost payment confirmation"""
+    token_address = session["token"]
+    expected_amount = session["price"]
+    start_time = datetime.utcnow()
+    
     try:
+        while (datetime.utcnow() - start_time) < timedelta(minutes=30):
+            if await SuiAPI.verify_payment(
+                BOOST_WALLET,
+                expected_amount,
+                start_time
+            ):
+                # Payment confirmed, apply boost
+                async with get_session() as db:
+                    boost = Boost(
+                        token_address=token_address,
+                        duration_hours=session["duration"],
+                        start_time=datetime.utcnow(),
+                        paid_amount=expected_amount,
+                        user_id=user_id
+                    )
+                    db.add(boost)
+                    await db.commit()
+                
+                # Update token cache
+                if token_address in token_cache:
+                    token_cache[token_address].is_boosted = True
+                
+                # Notify user
+                await bot.send_message(
+                    user_id,
+                    f"✅ Boost payment confirmed!\n\n"
+                    f"Your token will be boosted for {session['duration']} hours.\n"
+                    f"All buys will be shown in @moonbagstrending during this period!"
+                )
+                
+                # Notify trending channel
+                token_data = await SuiAPI.get_token_data(token_address)
+                await bot.send_message(
+                    TRENDING_CHANNEL,
+                    f"🚀 New Token Boost!\n\n"
+                    f"${token_data.symbol} ({token_data.name})\n"
+                    f"Duration: {session['duration']} hours\n"
+                    f"Contract: <code>{token_address}</code>\n\n"
+                    f"All buys will be displayed here during the boost period! 🔥"
+                )
+                
+                del boost_sessions[user_id]
+                return
+            
+            await asyncio.sleep(10)
+        
+        # Payment timeout
         await bot.send_message(
-            chat_id=TRENDING_CHANNEL,
-            text=f"🚀 <b>BOOST ACTIVATED</b> for <code>{data['token_address']}</code>! Every buy will be posted here for the next {data['duration']} hours!"
+            user_id,
+            "⚠️ Boost payment timeout. Please try again with /boost"
         )
-    except Exception:
-        pass
-    await state.clear()
+    except Exception as e:
+        logger.error(f"Error monitoring boost payment: {e}")
+        await bot.send_message(
+            user_id,
+            "❌ Error processing boost payment. Please contact support."
+        )
+    finally:
+        if user_id in boost_sessions:
+            del boost_sessions[user_id]
 
-# --- MAIN ENTRYPOINT ---
+async def process_buy_event(buy_data: BuyData):
+    """Process incoming buy events"""
+    try:
+        # Get token configuration for all groups tracking this token
+        async with get_session() as db:
+            groups = await db.execute(
+                select(GroupConfig).where(
+                    GroupConfig.token_address == buy_data.token_address
+                )
+            )
+            configs = groups.scalars().all()
+        
+        # Check if token is boosted
+        is_boosted = await check_token_boost(buy_data.token_address)
+        
+        # Process for each configured group
+        for config in configs:
+            if Decimal(buy_data.amount_usd) >= Decimal(config.min_buy):
+                message, keyboard = await format_buy_alert(buy_data, config)
+                
+                try:
+                    await bot.send_message(
+                        config.group_id,
+                        message,
+                        reply_markup=keyboard
+                    )
+                except TelegramAPIError as e:
+                    logger.error(f"Failed to send alert to group {config.group_id}: {e}")
+        
+        # Send to trending channel if meets criteria
+        if (
+            Decimal(buy_data.amount_usd) >= MIN_TRENDING_BUY
+            or is_boosted
+        ):
+            trending_message, trending_keyboard = await format_buy_alert(
+                buy_data,
+                configs[0],  # Use first config for formatting
+                is_trending=True
+            )
+            
+            await bot.send_message(
+                TRENDING_CHANNEL,
+                trending_message,
+                reply_markup=trending_keyboard
+            )
+    
+    except Exception as e:
+        logger.error(f"Error processing buy event: {e}")
 
-async def main():
+async def update_leaderboard():
+    """Update trending leaderboard every 30 minutes"""
+    while True:
+        try:
+            # Get top tokens by volume including boost effects
+            top_tokens = await SuiAPI.get_trending_tokens()
+            
+            message = (
+                "🏆 Sui Trending Tokens\n"
+                "Last 30 Minutes\n\n"
+            )
+            
+            for i, token in enumerate(top_tokens[:10], 1):
+                price_change = token.price_change_30m
+                change_symbol = "🟢" if price_change >= 0 else "🔴"
+                
+                message += (
+                    f"{i}. <a href='{token.telegram_link}'>${token.symbol}</a>\n"
+                    f"💰 MCap: ${token.mcap:,.0f}\n"
+                    f"📊 {change_symbol} {abs(price_change):.2f}%\n\n"
+                )
+            
+            # Send and pin in trending channel
+            sent = await bot.send_message(TRENDING_CHANNEL, message)
+            
+            try:
+                # Unpin previous message if exists
+                await bot.unpin_all_chat_messages(TRENDING_CHANNEL)
+                # Pin new message
+                await bot.pin_chat_message(TRENDING_CHANNEL, sent.message_id)
+            except TelegramAPIError as e:
+                logger.error(f"Error managing pins: {e}")
+            
+        except Exception as e:
+            logger.error(f"Error updating leaderboard: {e}")
+        
+        await asyncio.sleep(1800)  # 30 minutes
+
+async def check_token_boost(token_address: str) -> bool:
+    """Check if token is currently boosted"""
+    async with get_session() as db:
+        boost = await db.execute(
+            select(Boost)
+            .where(
+                Boost.token_address == token_address,
+                Boost.start_time + timedelta(hours=Boost.duration_hours) > datetime.utcnow()
+            )
+            .order_by(Boost.start_time.desc())
+        )
+        return bool(boost.scalar())
+
+async def startup():
+    """Startup tasks"""
+    # Initialize database
     await init_db()
-    # Start Sui event listener in background
-    asyncio.create_task(sui_api.listen_for_buys(handle_buy_event))
-    # Start leaderboard updater
-    asyncio.create_task(leaderboard_task())
-    # Start bot polling
-    await dp.start_polling(bot)
+    
+    # Start background tasks
+    asyncio.create_task(update_leaderboard())
+    asyncio.create_task(SuiAPI.start_buy_monitoring(process_buy_event))
+    
+    # Setup webhook for Render
+    if os.environ.get("WEBHOOK_URL"):
+        await bot.set_webhook(
+            url=f"{os.environ['WEBHOOK_URL']}/{BOT_TOKEN}",
+            drop_pending_updates=True
+        )
+        logger.info("Webhook set up successfully")
+
+async def shutdown():
+    """Shutdown tasks"""
+    await bot.delete_webhook()
+    await bot.session.close()
+
+def setup_web_app():
+    """Setup web app for Render"""
+    from aiohttp import web
+    
+    app = web.Application()
+    
+    async def handle_webhook(request):
+        if request.match_info.get("token") == BOT_TOKEN:
+            update = types.Update(**await request.json())
+            await dp.feed_update(bot, update)
+            return web.Response()
+        return web.Response(status=403)
+    
+    async def handle_health_check(request):
+        return web.Response(text="Moon BuyBot is running!")
+    
+    app.router.add_post(f"/{BOT_TOKEN}", handle_webhook)
+    app.router.add_get("/", handle_health_check)
+    
+    return app
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    from aiohttp import web
+    
+    # Setup web app
+    app = setup_web_app()
+    
+    # Register startup/shutdown
+    dp.startup.register(startup)
+    dp.shutdown.register(shutdown)
+    
+    # Start both bot and web server
+    web.run_app(
+        app,
+        host="0.0.0.0",
+        port=PORT,
+        access_log=logger
+    )
