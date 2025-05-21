@@ -17,9 +17,6 @@ python-dateutil==2.8.2
 pytz==2023.3.post1
 ujson==5.8.0
 
-# Number handling
-decimal==1.70
-
 # Production server
 gunicorn==21.2.0
 uvicorn==0.24.0
